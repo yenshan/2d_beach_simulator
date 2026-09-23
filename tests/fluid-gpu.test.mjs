@@ -65,9 +65,12 @@ test('GPU fluid: finite particles, beach collisions, waves, reset and pixel outp
     }
     assert(Math.abs(fluid.time-12)<1e-6);assert(maxSpeed>1&&maxSpeed<75);
     assert(highest>24,'Waves must rise above initial sea level');assert(coastalMotion>100,'Waves must reach the coast');
-    const pixels=device.createBuffer({size:512*256*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
-    const enc=device.createCommandEncoder();enc.copyTextureToBuffer({texture:output},{buffer:pixels,bytesPerRow:2048},{width:512,height:256});device.queue.submit([enc.finish()]);
-    await pixels.mapAsync(GPUMapMode.READ);const rgba=new Uint8Array(pixels.getMappedRange().slice(0));pixels.unmap();pixels.destroy();
+    const readPixels=async()=>{
+      const pixels=device.createBuffer({size:512*256*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+      const enc=device.createCommandEncoder();enc.copyTextureToBuffer({texture:output},{buffer:pixels,bytesPerRow:2048},{width:512,height:256});device.queue.submit([enc.finish()]);
+      await pixels.mapAsync(GPUMapMode.READ);const rgba=new Uint8Array(pixels.getMappedRange().slice(0));pixels.unmap();pixels.destroy();return rgba;
+    };
+    const rgba=await readPixels();
     assert.equal(rgba.length,512*256*4);assert.equal(rgba[3],255);assert.notEqual(rgba[0],rgba[4*(230*512)]);
     if(process.env.SHORE_TEST_IMAGE){
       const rgb=Buffer.alloc(512*256*3);for(let i=0;i<512*256;i++)rgb.set(rgba.subarray(i*4,i*4+3),i*3);
@@ -79,6 +82,47 @@ test('GPU fluid: finite particles, beach collisions, waves, reset and pixel outp
       for(let i=0;i<15;i++){fluid.frame(1/30,{...settings,height,period,speed:2});await device.queue.onSubmittedWorkDone();}
       await device.queue.onSubmittedWorkDone();assert((await readParticles()).every(Number.isFinite));
     }
+    // An isolated airborne water particle must survive the surface threshold
+    // as a white glint. Equally fast dense water must retain its water color.
+    const fixture=initial.slice();
+    fixture.set([80.125,40.125,5,-2,0,0,0,0,0.9,0.5,0,0],0);
+    fixture.set([90.125,40.125,5,-2,0,0,0,0,0,4,0,0],12);
+    device.queue.writeBuffer(fluid.particleBuffer,0,fixture);
+    fluid.frame(0,settings);const drops=await readPixels();
+    const pixel=(x,y)=>Array.from(drops.slice((y*512+x)*4,(y*512+x)*4+3));
+    const white=pixel(320,95),dense=pixel(360,95);
+    assert(Math.min(...white)>240,'Airborne droplet should be white');
+    assert(Math.max(...white)-Math.min(...white)<12,'Spray should be neutral, not cyan');
+    assert(dense[0]<230,'Speed alone must not whiten dense water');
+    // A submerged air pocket must not reset top-light attenuation. Its removal
+    // of a little water can transmit slightly more light, but cannot light a column.
+    const pool=initial.slice();
+    for(let i=0;i<fluid.count;i++)pool.set([70+(i%224)*.25,15+Math.floor(i/224)*.25,0,0,0,0,0,0,0,4,0,0],i*12);
+    device.queue.writeBuffer(fluid.particleBuffer,0,pool);fluid.frame(0,settings);
+    const solid=await readPixels();
+    for(let i=0;i<fluid.count;i++)if(Math.hypot(pool[i*12]-95,pool[i*12+1]-34)<1.5){pool[i*12]=145;pool[i*12+1]=35;}
+    device.queue.writeBuffer(fluid.particleBuffer,0,pool);fluid.frame(0,settings);
+    const pocket=await readPixels();
+    const below=(184*512+380)*4;
+    for(let channel=0;channel<3;channel++)assert(Math.abs(solid[below+channel]-pocket[below+channel])<=12,'Air pocket reset accumulated light attenuation');
+    const hole=(120*512+380)*4;
+    assert(pocket[hole]>solid[hole]+20,'Air pocket must reveal the unchanged sky background');
+    // Add a sheet of water above an otherwise unchanged sample. It must shade
+    // the water below, even with an air gap between sheet and sea.
+    const overhead=pool.slice();
+    for(let i=0;i<320;i++)overhead.set([90+(i%40)*.25,48+Math.floor(i/40)*.25,0,0,0,0,0,0,0,4,0,0],i*12);
+    device.queue.writeBuffer(fluid.particleBuffer,0,overhead);fluid.frame(0,settings);
+    const shaded=await readPixels();
+    const brightness=image=>image[below]+image[below+1]+image[below+2];
+    assert(brightness(shaded)<brightness(pocket)-2,'Overhead water must cast a shadow across the air gap');
+    // With all water outside the viewport, this is the reference sky. The air
+    // pocket must match it even when an extra water sheet is placed above it.
+    const empty=initial.slice();
+    for(let i=0;i<fluid.count;i++){empty[i*12]=145;empty[i*12+1]=35;}
+    device.queue.writeBuffer(fluid.particleBuffer,0,empty);fluid.frame(0,settings);
+    const sky=await readPixels();
+    assert.deepEqual(pocket.slice(hole,hole+3),sky.slice(hole,hole+3),'Air background was shadowed by water');
+    assert.deepEqual(shaded.slice(hole,hole+3),sky.slice(hole,hole+3),'Overhead sheet darkened air instead of just water');
     assert.deepEqual(errors,[],'WebGPU validation errors');
   } finally {fluid?.dispose();output.destroy();device.destroy();delete globalThis.navigator.gpu;}
 });

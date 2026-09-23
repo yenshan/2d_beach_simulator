@@ -40,12 +40,13 @@ export class FluidCore {
     this.uniform = buffer("substep parameters", this.uniforms.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const cells = buffer("atomic grid", GRID_CELLS * 16);
     const velocities = buffer("grid velocities", GRID_CELLS * 8);
-    const pixels = buffer("particle raster", WIDTH * HEIGHT * 8);
+    const pixels = buffer("particle raster", WIDTH * HEIGHT * 16);
+    const optics = buffer("top-light optical paths", WIDTH * HEIGHT * 5 * 4);
     this.wetBuffer = buffer("wet beach", WIDTH * 4);
-    this.buffers = [this.particleBuffer, this.uniform, cells, velocities, pixels, this.wetBuffer];
+    this.buffers = [this.particleBuffer, this.uniform, cells, velocities, pixels, this.wetBuffer, optics];
     const layout = device.createBindGroupLayout({ entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 32 } },
-      ...[1,2,3,4,6].map(binding => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" as const } })),
+      ...[1,2,3,4,6,7].map(binding => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" as const } })),
       { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "rgba8unorm" } },
     ] });
     this.bindGroup = device.createBindGroup({ layout, entries: [
@@ -56,6 +57,7 @@ export class FluidCore {
       { binding: 4, resource: { buffer: pixels } },
       { binding: 5, resource: output.createView() },
       { binding: 6, resource: { buffer: this.wetBuffer } },
+      { binding: 7, resource: { buffer: optics } },
     ] });
     this.pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
     this.reset();
@@ -68,7 +70,7 @@ export class FluidCore {
       const info = await module.getCompilationInfo();
       const errors = info.messages.filter(m => m.type === "error");
       if (errors.length) throw new Error(errors.map(m => `${m.lineNum}: ${m.message}`).join("\n"));
-      const names = ["clearGrid", "scatter", "pressure", "updateGrid", "gather", "clearPixels", "splat", "wetSand", "compose"];
+      const names = ["clearGrid", "scatter", "pressure", "updateGrid", "gather", "clearPixels", "splat", "wetSand", "opticalDepth", "compose"];
       await Promise.all(names.map(async name => {
         core.pipelines.set(name, await device.createComputePipelineAsync({ label: name, layout: core.pipelineLayout, compute: { module, entryPoint: name } }));
       }));
@@ -89,10 +91,10 @@ export class FluidCore {
     this.accumulator -= steps * FIXED_DT;
     const encoder = this.device.createCommandEncoder({ label: "fluid frame" });
     const values = new DataView(this.uniforms);
-    const params = (slot: number, step: number) => {
+    const params = (slot: number, step: number, optics = 0) => {
       const offset = slot * 256;
       [step, this.time, settings.height, settings.period, settings.wind].forEach((v, i) => values.setFloat32(offset + i * 4, v, true));
-      values.setUint32(offset + 20, this.count, true); values.setFloat32(offset + 24, 18, true);
+      values.setUint32(offset + 20, this.count, true); values.setFloat32(offset + 24, 18, true); values.setUint32(offset + 28, optics, true);
     };
     const dispatch = (name: string, count: number, slot: number, y = 1) => {
       const pass = encoder.beginComputePass(); pass.setPipeline(this.pipelines.get(name)!);
@@ -110,6 +112,7 @@ export class FluidCore {
     dispatch("clearPixels", WIDTH * HEIGHT / 64, steps);
     dispatch("splat", Math.ceil(this.count / 64), steps);
     dispatch("wetSand", WIDTH / 64, steps);
+    dispatch("opticalDepth", 640 / 64, steps);
     dispatch("compose", WIDTH / 8, steps, HEIGHT / 8);
     this.device.queue.writeBuffer(this.uniform, 0, this.uniforms, 0, (steps + 1) * 256);
     this.device.queue.submit([encoder.finish()]);

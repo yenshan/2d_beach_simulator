@@ -16,7 +16,7 @@ export class GpuOcean {
   get time() { return this.core?.time ?? 0; }
   get count() { return this.core.count; }
   private constructor(canvas: HTMLCanvasElement) {
-    this.renderer = new THREE.WebGPURenderer({ canvas, antialias: false, alpha: false, requiredLimits: { maxStorageBuffersPerShaderStage: 5 } });
+    this.renderer = new THREE.WebGPURenderer({ canvas, antialias: false, alpha: false, requiredLimits: { maxStorageBuffersPerShaderStage: 6 } });
     this.renderer.setPixelRatio(1); this.renderer.setSize(WIDTH, HEIGHT, false);
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.image.minFilter = THREE.NearestFilter; this.image.magFilter = THREE.NearestFilter;

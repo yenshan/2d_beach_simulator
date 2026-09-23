@@ -11,10 +11,10 @@ const R: f32 = ${GRID_SCALE.toFixed(1)};
 const PARTICLE_MASS: f32 = ${PARTICLE_MASS.toFixed(8)};
 const PARTICLE_CLEARANCE: f32 = ${PARTICLE_CLEARANCE.toFixed(8)};
 const SCALE: f32 = 100000.0;
-struct Params { dt:f32, time:f32, height:f32, period:f32, wind:f32, count:u32, gravity:f32, pad:f32 }
+struct Params { dt:f32, time:f32, height:f32, period:f32, wind:f32, count:u32, gravity:f32, optics:u32 }
 struct Particle { pos:vec2f, vel:vec2f, affine:vec4f, foam:f32, density:f32, pad:vec2f }
 struct Cell { mass:atomic<i32>, mx:atomic<i32>, my:atomic<i32>, pad:atomic<i32> }
-struct Pixel { mass:atomic<i32>, foam:atomic<i32> }
+struct Pixel { mass:atomic<i32>, foam:atomic<i32>, spray:atomic<i32>, depth:f32 }
 @group(0) @binding(0) var<uniform> params:Params;
 @group(0) @binding(1) var<storage,read_write> particles:array<Particle>;
 @group(0) @binding(2) var<storage,read_write> cells:array<Cell>;
@@ -22,6 +22,7 @@ struct Pixel { mass:atomic<i32>, foam:atomic<i32> }
 @group(0) @binding(4) var<storage,read_write> pixels:array<Pixel>;
 @group(0) @binding(5) var outputImage:texture_storage_2d<rgba8unorm,write>;
 @group(0) @binding(6) var<storage,read_write> wet:array<f32>;
+@group(0) @binding(7) var<storage,read_write> lightPaths:array<f32>;
 fn bed(x:f32)->f32 { return max(3.0,31.5-0.24*x); }
 fn wall()->vec2f {
  let ramp=smoothstep(0.0,3.0,params.time);
@@ -101,23 +102,33 @@ fn gather(@builtin(global_invocation_id) id:vec3u) {
  if(p.pos.y<floorHeight){p.pos.y=floorHeight;let n=normalize(vec2f(select(0.24,0.0,p.pos.x>118.75),1));p.vel-=n*min(dot(p.vel,n),0.0);}
  let strain=abs(p.affine.y+p.affine.z)+abs(p.affine.x-p.affine.w);
  let surface=1.0-smoothstep(2.6,3.9,p.density);
- let source=surface*smoothstep(2.0,8.0,length(v))*smoothstep(1.0,7.0,strain);
- p.foam=max(p.foam*exp(-params.dt*0.55),source);
+ let compression=max(0.0,-p.affine.x-p.affine.w);
+ let breaking=surface*smoothstep(2.5,9.0,length(v))*smoothstep(3.0,12.0,strain+compression);
+ let detached=(1.0-smoothstep(0.8,1.7,p.density))*smoothstep(1.0,4.0,length(v));
+ // Entrained air follows the water, then dissipates after re-entry.
+ let source=max(breaking,detached*0.9);
+ p.foam=max(p.foam*exp(-params.dt*mix(0.85,0.45,surface)),source);
  particles[i]=p;
 }
 @compute @workgroup_size(64)
 fn clearPixels(@builtin(global_invocation_id) id:vec3u) {
- let i=id.x;if(i>=512u*256u){return;}atomicStore(&pixels[i].mass,0);atomicStore(&pixels[i].foam,0);
+ let i=id.x;if(i>=512u*256u){return;}atomicStore(&pixels[i].mass,0);atomicStore(&pixels[i].foam,0);atomicStore(&pixels[i].spray,0);pixels[i].depth=0.0;
 }
 @compute @workgroup_size(64)
 fn splat(@builtin(global_invocation_id) id:vec3u) {
  let i=id.x;if(i>=params.count){return;}let p=particles[i];let center=vec2f(p.pos.x*4.0,256.0-p.pos.y*4.0);
  let base=vec2i(floor(center));
+ // Render separated droplets as compact 1–2 pixel glints, even below the
+ // continuous-water density threshold. Fast but dense water is not spray.
+ let detached=(1.0-smoothstep(0.8,1.7,p.density))*smoothstep(0.5,2.0,p.pos.y-bed(p.pos.x));
+ let spray=detached*max(p.foam,smoothstep(1.0,4.0,length(p.vel)));
  for(var dy=-3;dy<=3;dy++){for(var dx=-3;dx<=3;dx++){
   let pixel=base+vec2i(dx,dy);if(pixel.x<0||pixel.x>=512||pixel.y<0||pixel.y>=256){continue;}
   let d=vec2f(pixel)+0.5-center;let a=max(0.0,1.0-dot(d,d)/7.84);let amount=a*a*512.0*PARTICLE_MASS;
   let index=u32(pixel.y)*512u+u32(pixel.x);
   atomicAdd(&pixels[index].mass,i32(amount));atomicAdd(&pixels[index].foam,i32(amount*p.foam));
+  let glint=max(0.0,1.0-dot(d,d)/1.8)*spray;
+  atomicAdd(&pixels[index].spray,i32(glint*512.0));
  }}
 }
 fn densityAt(p:vec2i)->f32 {
@@ -128,7 +139,39 @@ fn wetSand(@builtin(global_invocation_id) id:vec3u) {
  let x=id.x;if(x>=512u){return;}let y=i32(256.0-bed(f32(x)*0.25)*4.0)-2;
  wet[x]=max(wet[x]*exp(-params.dt*0.025),smoothstep(0.2,0.8,densityAt(vec2i(i32(x),y))));
 }
+// A soft source above the screen sends five downward rays. Accumulated
+// extinction is NEVER reset by air gaps: an underwater hole is not a light source.
+@compute @workgroup_size(64)
+fn opticalDepth(@builtin(global_invocation_id) id:vec3u) {
+ if(id.x>=640u){return;}
+ let origin=i32(id.x)-64;
+ for(var ray=0u;ray<5u;ray++){
+  let slope=(f32(ray)-2.0)*0.12;var depth=0.0;
+  for(var y=0u;y<256u;y++){
+   let x=origin+i32(floor(f32(y)*slope));
+   if(x<0||x>=512){continue;}
+   let index=y*512u+u32(x);
+   let density=f32(atomicLoad(&pixels[index].mass))/512.0;
+   let foam=f32(atomicLoad(&pixels[index].foam))/512.0;
+   let amount=clamp(density*0.5,0.0,1.2)+clamp(foam*0.18,0.0,0.4);
+   lightPaths[index*5u+ray]=depth+amount*0.5;
+   depth+=amount*sqrt(1.0+slope*slope);
+  }
+ }
+}
+fn opticalAmount(index:u32)->f32 {
+ return (lightPaths[index*5u]+2.0*lightPaths[index*5u+1u]+3.0*lightPaths[index*5u+2u]+2.0*lightPaths[index*5u+3u]+lightPaths[index*5u+4u])/9.0;
+}
+fn sunlight(index:u32)->vec3f {
+ let weights=array<f32,5>(1.0,2.0,3.0,2.0,1.0);var light=vec3f(0);
+ for(var ray=0u;ray<5u;ray++){
+  light+=exp(-vec3f(1.45,0.43,0.24)*(lightPaths[index*5u+ray]*0.034+0.20))*weights[ray];
+ }
+ return light/9.0;
+}
 fn hash(p:vec2u)->f32 {var h=p.x*1973u+p.y*9277u+89173u;h=(h^(h>>13u))*1274126177u;return f32(h&65535u)/65535.0;}
+fn toLinear(c:vec3f)->vec3f {return select(pow((c+0.055)/1.055,vec3f(2.4)),c/12.92,c<=vec3f(0.04045));}
+fn toSrgb(c:vec3f)->vec3f {let q=max(c,vec3f(0));return select(1.055*pow(q,vec3f(1.0/2.4))-0.055,q*12.92,q<=vec3f(0.0031308));}
 @compute @workgroup_size(8,8)
 fn compose(@builtin(global_invocation_id) id:vec3u) {
  if(id.x>=512u||id.y>=256u){return;}let p=vec2i(id.xy);let point=vec2f(id.xy)+0.5;
@@ -140,21 +183,39 @@ fn compose(@builtin(global_invocation_id) id:vec3u) {
   color=vec3f(0.87,0.79,0.61)-damp*vec3f(0.17,0.15,0.10)+noise*0.046;
   color+=sin(deep*0.14+sin(point.x/66.0))*0.008;
  }else{
-  let density=densityAt(p);
+  let index=id.y*512u+id.x;let density=densityAt(p);
+  let spray=clamp(f32(atomicLoad(&pixels[index].spray))/512.0,0.0,1.0);
   if(density>0.40){
-   let dx=densityAt(p+vec2i(1,0))-densityAt(p-vec2i(1,0));
-   let dy=densityAt(p+vec2i(0,1))-densityAt(p-vec2i(0,1));
-   let deep=clamp((point.y-150.0)/100.0,0.0,1.0);
-   var water=mix(vec3f(0.09,0.56,0.57),vec3f(0.025,0.25,0.34),deep);
-   let surface=1.0-smoothstep(0.45,1.15,density);
-   water+=vec3f(0.07,0.16,0.12)*surface+clamp(dy-dx*0.4,-0.4,0.8)*0.09*surface;
-   let index=id.y*512u+id.x;
-   let foam=f32(atomicLoad(&pixels[index].foam))/(512.0*max(density,0.01));
-   water=mix(water,vec3f(0.91,0.97,0.90),clamp(foam*(0.78+noise*0.35)*(0.15+0.85*surface),0.0,0.95));
-   color=mix(color,water,smoothstep(0.40,0.68,density));
+   let depth=opticalAmount(index);
+   let dx=densityAt(p+vec2i(2,0))-densityAt(p-vec2i(2,0));
+   let dy=densityAt(p+vec2i(0,2))-densityAt(p-vec2i(0,2));
+   let edge=(1.0-smoothstep(1.0,5.0,depth))*smoothstep(0.15,1.2,length(vec2f(dx,dy)));
+   let normal=normalize(vec3f(-dx,-dy,0.65));
+   // Beer–Lambert-inspired RGB attenuation in linear light. This is a 2D
+   // optical proxy, not a volumetric ray trace: red attenuates fastest.
+   let transmission=sunlight(index);
+   let bottomLight=exp(-max(0.0,sandY-point.y)/17.0);
+   let transmitted=mix(toLinear(vec3f(0.42,0.77,0.71)),toLinear(vec3f(0.70,0.72,0.53)),bottomLight*0.65);
+   var water=transmitted*transmission+toLinear(vec3f(0.025,0.28,0.36))*(1.0-transmission);
+   // Directional sky reflection and a restrained sunlight highlight.
+   let fresnel=0.02+0.98*pow(1.0-clamp(normal.z,0.0,1.0),5.0);
+   let reflected=mix(toLinear(vec3f(0.43,0.65,0.76)),toLinear(vec3f(0.84,0.93,0.96)),clamp(-normal.y*0.5+0.5,0.0,1.0));
+   water=mix(water,reflected,edge*(0.10+fresnel*0.64));
+   let sun=pow(max(0.0,dot(normal,normalize(vec3f(-0.35,-0.55,0.76)))),32.0)*edge;
+   water+=vec3f(0.85,0.84,0.73)*sun*0.55;
+   let foam=clamp(f32(atomicLoad(&pixels[index].foam))/(512.0*max(density,0.01)),0.0,1.0);
+   let bubbles=smoothstep(0.04,0.72,foam);
+   let surfaceFoam=1.0-smoothstep(2.0,11.0,depth);
+   let foamColor=mix(toLinear(vec3f(0.38,0.70,0.68)),toLinear(vec3f(0.96,0.98,0.95)),surfaceFoam);
+   water=mix(water,foamColor,bubbles*mix(0.40,0.94,surfaceFoam)*(0.96+noise*0.08));
+   color=mix(color,toSrgb(water),smoothstep(0.40,0.68,density));
   }
+  // Air is transparent: attenuation affects water and droplets, never the backdrop.
+  // White droplets also dim when screened by water above.
+  let droplet=smoothstep(0.04,0.62,spray)*(1.0-smoothstep(0.55,1.4,density));
+  let dropletLight=0.30+0.70*exp(-opticalAmount(index)*0.04);
+  color=mix(color,vec3f(0.98,0.99,0.97)*dropletLight,droplet);
  }
- // Storage texture contains sRGB values; the Three.js material decodes these.
  textureStore(outputImage,p,vec4f(clamp(color,vec3f(0),vec3f(1)),1));
 }
 `;
